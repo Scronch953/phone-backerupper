@@ -29,6 +29,8 @@
 #                 Without a mode, the folder is just the latest sync (the default).
 #   --plain       no fancy menus (plain numbered prompts)
 #   --dest DIR    folder for the plain copy        --repo PATH   Borg repo to use this run
+#   --exclude PAT      skip files/folders matching PAT (repeatable); --exclude-file FILE; --show-excludes
+#                      (patterns: see README. e.g. --exclude "*.tmp" --exclude "DCIM/Camera/old")
 #   --workdir DIR scratch space (archive mount point, temp files; small - no full copies are staged)
 #
 # Extras (optional; the menu has a "More..." entry, or pass these as --mode for scripts/agents):
@@ -60,6 +62,7 @@ MIN_FREE_GB=20                      # refuse a Borg backup below this much free 
 MIN_UNALLOC_GB=10                   # btrfs repo drive: refuse if unallocated space is this low
 KEEP=(--keep-daily 7 --keep-weekly 8 --keep-monthly 24 --keep-yearly 10)   # archive pruning
 
+EXCLUDE_FILE=""                     # exclusions file (default ~/.config/phone-backup.exclude), see README
 WORK_DIR=""                         # scratch space (archive mount point, temp files); default ~/.local/state/phone-backup
 CACHE_DIR=""                        # Borg cache location (BORG_CACHE_DIR); default: Borg's own (~/.cache/borg)
 
@@ -75,6 +78,7 @@ CONF="${PHONE_BACKUP_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/phone-backup.conf}"
 # shellcheck disable=SC1090
 [ -r "$CONF" ] && . "$CONF"
 
+EXCLUDE_CLI=(); SHOWEX=0
 NEW_REPO=""; ENC=none; TO_REPO=""; TO_MAJOR=""; DELETE_SRC=0; CLI_REPO=""; STATUS=0; LISTARCH=0
 MODE=""; ARCHREF=""; YES=0; COMPACT=0; PRUNE=1; PLAIN=0; FULL=0; FULL_SET=0
 while [ $# -gt 0 ]; do
@@ -94,6 +98,9 @@ while [ $# -gt 0 ]; do
     --plain) PLAIN=1 ;;
     --dest) DEST="${2:-}"; shift ;;
     --workdir) WORK_DIR="${2:-}"; shift ;;
+    --exclude) EXCLUDE_CLI+=("${2:-}"); shift ;;
+    --exclude-file) EXCLUDE_FILE="${2:-}"; shift ;;
+    --show-excludes) SHOWEX=1 ;;
     --repo) CLI_REPO="${2:-}"; shift ;;
     --new-repo) NEW_REPO="${2:-}"; shift ;;
     --encryption) ENC="${2:-}"; shift ;;
@@ -113,6 +120,7 @@ case "$HISTORY" in ""|reflink|hardlink) ;; *) echo "--history must be reflink or
 
 GVFS="/run/user/$(id -u)/gvfs"
 STATE="$HOME/.local/state/phone-backup"
+[ -n "$EXCLUDE_FILE" ] || EXCLUDE_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/phone-backup.exclude"
 WORK_DIR="${WORK_DIR:-$STATE}"
 MNT_DIR="$WORK_DIR/archive-mount"
 mkdir -p "$STATE" "$WORK_DIR/tmp" || exit 1
@@ -261,22 +269,62 @@ phone_free() { gio info -a filesystem::free "mtp://$(dev_name "$1")/" 2>/dev/nul
 # ---- include/exclude rules (media only by default, everything with --full) ---------------------------
 RSYNC_FILTER=()
 PAT="$STATE/patterns.txt"
+# Exclusions file: one pattern per line; "#" comments. Sections: [all] (default), [folder], [borg].
+#   name or glob without "/"  -> matches at any depth        (*.tmp   Screenshots   .thumbnails)
+#   contains "/"              -> path from the storage root  (DCIM/Camera/old   Android/media/com.whatsapp)
+#   trailing "/"              -> folders only (rsync only; Borg just ignores the slash)
+EX_FOLDER=(); EX_BORG=()
+ex_add() {   # ex_add SECTION PATTERN
+  local sect=$1 pat=$2 dironly=0 anchored=0 r b
+  case "$pat" in */) dironly=1; pat=${pat%/} ;; esac
+  case "$pat" in /*) pat=${pat#/}; anchored=1 ;; esac
+  case "$pat" in */*) anchored=1 ;; esac
+  [ -n "$pat" ] || return 0
+  if [ $anchored = 1 ]; then r="/$pat"; b="! sh:*/$pat"; else r="$pat"; b="! sh:**/$pat"; fi
+  [ $dironly = 1 ] && r="$r/"
+  case "$sect" in
+    all) EX_FOLDER+=("--exclude=$r"); EX_BORG+=("$b") ;;
+    folder) EX_FOLDER+=("--exclude=$r") ;;
+    borg) EX_BORG+=("$b") ;;
+  esac
+}
+load_excludes() {
+  local line sect=all x
+  for x in "${EXCLUDE_CLI[@]}"; do ex_add all "$x"; done
+  [ -r "$EXCLUDE_FILE" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+    case "$line" in
+      ''|'#'*) ;;
+      '[all]') sect=all ;;  '[folder]') sect=folder ;;  '[borg]') sect=borg ;;
+      '['*) echo "warning: unknown section $line in $EXCLUDE_FILE (use [all], [folder] or [borg])" >&2 ;;
+      *) ex_add "$sect" "$line" ;;
+    esac
+  done < "$EXCLUDE_FILE"
+}
+
 build_filters() {
-  local e extre
+  local e extre x
+  load_excludes
   if [ $FULL = 1 ]; then
-    : > "$PAT"                       # no patterns: Borg takes everything
     SERIES=phone-full
+    RSYNC_FILTER=("${EX_FOLDER[@]}")
+    : > "$PAT"                                   # only your exclusions: everything else is taken
+    [ ${#EX_BORG[@]} -eq 0 ] || printf '%s\n' "${EX_BORG[@]}" >> "$PAT"
     return
   fi
   SERIES=phone-media
   extre=$(IFS='|'; echo "${EXTS[*]}")
-  RSYNC_FILTER=(--prune-empty-dirs
+  RSYNC_FILTER=(--prune-empty-dirs "${EX_FOLDER[@]}"
     --exclude='/Android/data/' --exclude='/Android/obb/'
     --exclude='.thumbnails/' --exclude='.trash*/' --exclude='.Trash*/'
     --exclude='.trashed-*' --exclude='.pending-*' --include='*/')
   for e in "${EXTS[@]}"; do RSYNC_FILTER+=(--include="*.$e" --include="*.${e^^}"); done
   RSYNC_FILTER+=(--exclude='*')
-  cat > "$PAT" <<EOF
+  {
+    [ ${#EX_BORG[@]} -eq 0 ] || printf '%s\n' "${EX_BORG[@]}"
+    cat <<EOF
 ! sh:**/Android/data
 ! sh:**/Android/obb
 ! sh:**/.thumbnails
@@ -286,6 +334,27 @@ build_filters() {
 + re:(?i)\.($extre)\$
 - re:.
 EOF
+  } > "$PAT"
+}
+
+x_edit_excludes() {
+  if [ ! -e "$EXCLUDE_FILE" ]; then
+    mkdir -p "$(dirname "$EXCLUDE_FILE")"
+    cat > "$EXCLUDE_FILE" <<'EOF'
+# Phone Backerupper exclusions. One pattern per line.
+#   name or glob without "/"  matches at any depth:   *.tmp     Screenshots
+#   a pattern with "/" is a path from the storage root: DCIM/Camera/old    Android/media/com.whatsapp
+#   a trailing "/" means folders only (rsync; Borg ignores the slash)
+# Patterns here apply to BOTH the folder copy and Borg. For one only, use a section:
+#   [folder]   only the rsync folder copy        [borg]   only Borg        [all]   both (the default)
+#
+# Examples:
+# *.tmp
+# Screenshots/
+# Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Video
+EOF
+  fi
+  "${EDITOR:-nano}" "$EXCLUDE_FILE"
 }
 
 # ---- generic "copy a tree" with a space check ------------------------------------------------------------
@@ -587,7 +656,7 @@ extras_menu() {
       "Switch the Borg repo used in this session" \
       "Create a new Borg repo" \
       "Copy archives to another repo" \
-      "Prune old archives" "Compact repo (free space)" "Check repo" "Break a stale lock" "Back") || return 0
+      "Edit exclusions file" "Prune old archives" "Compact repo (free space)" "Check repo" "Break a stale lock" "Back") || return 0
   case "$x" in
     Switch*) m=$(choose "Borg version of that repo" "Borg 1 (stable)" "Borg 2 (experimental)") || return 0
       case "$m" in "Borg 1"*) m=1 ;; *) m=2 ;; esac
@@ -611,6 +680,7 @@ extras_menu() {
         while IFS= read -r desc; do [ -n "$desc" ] && refs+=("${map[$desc]}"); done <<< "$picked"
       fi
       x_transfer "$dm" "$to" 0 "${refs[@]}" ;;
+    Edit*) x_edit_excludes; return 0 ;;
     Prune*) x_prune ;;
     Compact*) x_compact ;;
     Check*) x_check ;;
@@ -623,7 +693,7 @@ extras_menu() {
 
 # ---- choose what to do (before logging starts, so the menus own the terminal) -------------------------------
 ASK=0
-if [ -z "$MODE" ] && [ $STATUS = 0 ] && [ $LISTARCH = 0 ]; then
+if [ -z "$MODE" ] && [ $STATUS = 0 ] && [ $LISTARCH = 0 ] && [ $SHOWEX = 0 ]; then
   [ $INTERACTIVE = 1 ] || fail "no terminal to ask on; pass --mode (see --help)"
   while :; do
     banner
@@ -639,6 +709,13 @@ if [ -z "$MODE" ] && [ $STATUS = 0 ] && [ $LISTARCH = 0 ]; then
   ASK=1
 fi
 
+if [ $SHOWEX = 1 ]; then
+  build_filters
+  echo "# exclusions file: $EXCLUDE_FILE ($([ -r "$EXCLUDE_FILE" ] && echo found || echo none))"
+  echo "# folder copy (rsync):"; [ ${#EX_FOLDER[@]} -eq 0 ] || printf '%s\n' "${EX_FOLDER[@]}"
+  echo "# Borg:"; [ ${#EX_BORG[@]} -eq 0 ] || printf '%s\n' "${EX_BORG[@]}"
+  exit 0
+fi
 # read-only info for scripts/agents
 if [ $STATUS = 1 ]; then
   m=absent; ls -d "$GVFS"/mtp:* >/dev/null 2>&1 && m=connected

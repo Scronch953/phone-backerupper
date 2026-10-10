@@ -61,6 +61,26 @@ after each Phone → Folder sync in `<folder>-history/`:
 * Without either, each dated copy would be a full duplicate and eat disk space - which is why it is off by default.
 * `HISTORY_KEEP=N` in the config keeps only the newest N copies (it deletes older ones from the history folder only).
 
+## Exclusions
+
+Skip files or folders with an exclusions file, `~/.config/phone-backup.exclude` (or `EXCLUDE_FILE=` in the config, `--exclude-file FILE`, or `--exclude PATTERN` on the command line). Menu: **More... > Edit exclusions file** creates a commented template and opens it in `$EDITOR`.
+
+```
+# one pattern per line
+*.tmp                         # no "/" : matches at any depth
+Screenshots/                  # trailing "/" : folders only (rsync; Borg ignores the slash)
+DCIM/Camera/old               # contains "/" : path from the storage root
+Android/media/com.whatsapp/WhatsApp/Media/WhatsApp Video
+
+[folder]                      # only the rsync folder copy
+Download/
+[borg]                        # only Borg
+*.mp4
+[all]                         # back to both (the default at the top of the file)
+```
+
+The same file feeds both, so the folder copy and the Borg archives match by default; use `[folder]` / `[borg]` sections only if you want them to differ. Patterns are shell globs and are case-sensitive (`*.TMP` is not `*.tmp`). Exclusions apply when backing up from the phone or the folder (not to restores), in both the default images-and-videos mode and `--full`. `--show-excludes` prints what will be passed to rsync and Borg. Excluding something does not remove it from existing archives or the folder.
+
 ## Extras (optional)
 
 None of this is needed for ordinary phone backups. In the menu: **More...**
