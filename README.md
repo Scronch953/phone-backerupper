@@ -79,6 +79,12 @@ Download/
 [all]                         # back to both (the default at the top of the file)
 ```
 
+Example - skip TV episodes, which have an `S01E02`-style marker in the name (any case, any folder):
+
+```
+*[Ss][0-9][0-9][Ee][0-9][0-9]*
+```
+
 The same file feeds both, so the folder copy and the Borg archives match by default; use `[folder]` / `[borg]` sections only if you want them to differ. Patterns are shell globs and are case-sensitive (`*.TMP` is not `*.tmp`). Exclusions apply when backing up from the phone or the folder (not to restores), in both the default images-and-videos mode and `--full`. `--show-excludes` prints what will be passed to rsync and Borg. Excluding something does not remove it from existing archives or the folder.
 
 ## Extras (optional)
