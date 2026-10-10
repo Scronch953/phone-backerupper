@@ -35,6 +35,9 @@
 #
 # Extras (optional; the menu has a "More..." entry, or pass these as --mode for scripts/agents):
 #   --mode prune | compact | check | unlock      repo maintenance (prune uses the retention in KEEP)
+#   --mode apply-excludes --target folder|borg|both [--archive REF] [--compact] --yes
+#                 apply the exclusions file to EXISTING backups: deletes matching files from the folder copy
+#                 and/or rewrites Borg archives without them (permanent! all phone archives unless --archive)
 #   --mode init --new-repo PATH [--encryption none|passphrase]   create a new Borg repo (--borg1/--borg2)
 #   --mode transfer --to-repo PATH [--to-borg 1|2] [--delete-source]
 #                 copy the phone archives into another repo (Borg 2 -> Borg 2 uses `borg transfer`,
@@ -78,7 +81,7 @@ CONF="${PHONE_BACKUP_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/phone-backup.conf}"
 # shellcheck disable=SC1090
 [ -r "$CONF" ] && . "$CONF"
 
-EXCLUDE_CLI=(); SHOWEX=0
+EXCLUDE_CLI=(); SHOWEX=0; TARGET=""
 NEW_REPO=""; ENC=none; TO_REPO=""; TO_MAJOR=""; DELETE_SRC=0; CLI_REPO=""; STATUS=0; LISTARCH=0
 MODE=""; ARCHREF=""; YES=0; COMPACT=0; PRUNE=1; PLAIN=0; FULL=0; FULL_SET=0
 while [ $# -gt 0 ]; do
@@ -101,6 +104,7 @@ while [ $# -gt 0 ]; do
     --exclude) EXCLUDE_CLI+=("${2:-}"); shift ;;
     --exclude-file) EXCLUDE_FILE="${2:-}"; shift ;;
     --show-excludes) SHOWEX=1 ;;
+    --target) TARGET="${2:-}"; shift ;;
     --repo) CLI_REPO="${2:-}"; shift ;;
     --new-repo) NEW_REPO="${2:-}"; shift ;;
     --encryption) ENC="${2:-}"; shift ;;
@@ -289,6 +293,7 @@ ex_add() {   # ex_add SECTION PATTERN
   esac
 }
 load_excludes() {
+  EX_FOLDER=(); EX_BORG=()
   local line sect=all x
   for x in "${EXCLUDE_CLI[@]}"; do ex_add all "$x"; done
   [ -r "$EXCLUDE_FILE" ] || return 0
@@ -441,14 +446,18 @@ make_history() {
   mkdir -p "$HISTORY_DIR"
   if cp "${cpopt[@]}" "$DEST" "$snap" 2>/dev/null; then log "history copy ($HISTORY): $snap"
   else
-    rm -rf "$snap"
+    # only ever remove the dated folder we just tried to create
+    case "$snap" in "$HISTORY_DIR"/????-??-??_??-??) [ -d "$snap" ] && [ ! -L "$snap" ] && rm -rf -- "${snap:?}" ;; esac
     log "history copy failed - does this filesystem support '$HISTORY'? (reflink: btrfs/XFS only; hardlink: same filesystem only)"
     return 1
   fi
   if [ "$HISTORY_KEEP" -gt 0 ]; then
     n=0
     for old in $(ls -1d "$HISTORY_DIR"/????-??-??_??-?? 2>/dev/null | sort -r); do
-      n=$((n+1)); [ $n -gt "$HISTORY_KEEP" ] && { log "removing old history copy $old"; rm -rf "$old"; }
+      n=$((n+1)); if [ $n -gt "$HISTORY_KEEP" ]; then
+        case "$old" in "$HISTORY_DIR"/????-??-??_??-??) [ -d "$old" ] && [ ! -L "$old" ] \
+          && { log "removing old history copy $old"; rm -rf -- "${old:?}"; } ;; esac
+      fi
     done
   fi
 }
@@ -650,13 +659,94 @@ x_transfer() {
   fi
 }
 
+# Apply the exclusions to what is already backed up. DESTRUCTIVE: always asks (unless --yes).
+x_apply_excludes_folder() {
+  local st n total=0 out line rel dev err roots=() victims=() v moved=0 skipped=0
+  load_excludes
+  [ ${#EX_FOLDER[@]} -gt 0 ] || { log "no exclusions defined ($EXCLUDE_FILE)"; return 1; }
+  command -v gio >/dev/null || fail "gio (trash) not found - refusing to delete without a trash"
+  for dev in "$DEST"/*/; do for st in "$dev"*/; do [ -d "$st" ] && roots+=("${st%/}"); done; done
+  [ ${#roots[@]} -gt 0 ] || { log "no folder copy in $DEST"; return 1; }
+  # Find the matches with rsync's own matching (source = destination, dry run), so they are exactly
+  # what a sync would have skipped. Files are only ever MOVED TO THE TRASH (gio trash), never rm'd.
+  for st in "${roots[@]}"; do
+    out=$(rsync -rn -i -8 --ignore-existing --delete-excluded "${EX_FOLDER[@]}" "$st/" "$st/" 2>/dev/null \
+          | sed -n 's/^\*deleting  *//p' | grep -v '/$')
+    n=0
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      rel=$(printf '%b' "$(sed 's/\\#\([0-7][0-7][0-7]\)/\\\1/g' <<< "$line")")   # rsync escapes odd bytes as \#ooo
+      case "$rel" in /*|../*|*/../*|..|"") skipped=$((skipped+1)); continue ;; esac
+      [ -f "$st/$rel" ] && [ ! -L "$st/$rel" ] || { skipped=$((skipped+1)); continue; }
+      victims+=("$st/$rel"); n=$((n+1))
+    done <<< "$out"
+    total=$((total + n))
+    log "$st: $n file(s) match the exclusions"
+  done
+  [ "$skipped" -eq 0 ] || log "$skipped listed item(s) could not be matched to a plain file and will be left alone"
+  [ "$total" -gt 0 ] || { log "nothing in the folder copy matches the exclusions"; return 0; }
+  for v in "${victims[@]:0:15}"; do log "    ${v#"$DEST"/}"; done
+  [ "$total" -gt 15 ] && log "    ... and $((total-15)) more"
+  if [ "$YES" = 0 ]; then
+    [ $INTERACTIVE = 1 ] || fail "refusing to remove files without --yes"
+    confirm "Move these $total file(s) to the Trash? (restorable; the phone is untouched)" || { log "cancelled"; return 0; }
+  fi
+  for v in "${victims[@]}"; do
+    if err=$(gio trash -- "$v" 2>&1); then moved=$((moved+1)); else skipped=$((skipped+1)); log "could not trash ${v#"$DEST"/}: ${err#gio: }"; fi
+  done
+  for st in "${roots[@]}"; do find "$st" -mindepth 1 -type d -empty -delete 2>/dev/null; done   # empty folders only
+  log "moved $moved file(s) to the Trash ($skipped left alone). Empty the Trash to get the disk space back."
+  [ "$skipped" -eq 0 ]
+}
+
+# x_apply_excludes_borg [ref...]   (no refs = every phone archive)
+x_apply_excludes_borg() {
+  local refs=("$@") ref lines n want=0 pf="$STATE/exclude-only.txt" out sc
+  load_excludes
+  [ ${#EX_BORG[@]} -gt 0 ] || { log "no exclusions defined ($EXCLUDE_FILE)"; return 1; }
+  printf '%s\n' "${EX_BORG[@]}" > "$pf"
+  borg_check_repo
+  if [ ${#refs[@]} -eq 0 ]; then
+    lines=$(list_archives) || fail "could not list archives"
+    while IFS='|' read -r ref _; do [ -n "$ref" ] && refs+=("$ref"); done <<< "$lines"
+  fi
+  [ ${#refs[@]} -gt 0 ] || { log "no phone archives in $REPO"; return 0; }
+  log "checking ${#refs[@]} archive(s) in $REPO against the exclusions ..."
+  for ref in "${refs[@]}"; do
+    if [ "$BORG_MAJOR" = 1 ]; then out=$("$BORG" recreate -n --list --patterns-from "$pf" "$REPO::$ref" 2>&1)
+    else out=$("$BORG" recreate -n --list -a "$ref" --patterns-from "$pf" 2>&1); fi
+    n=$(grep -cE '^- ' <<< "$out")
+    log "  $ref: $n item(s) would be removed"
+    want=$((want + n))
+  done
+  [ "$want" -gt 0 ] || { log "no archive contains anything matching the exclusions"; return 0; }
+  if [ "$YES" = 0 ]; then
+    [ $INTERACTIVE = 1 ] || fail "refusing to rewrite archives without --yes"
+    confirm "Rewrite ${#refs[@]} archive(s) without these files? This is permanent." || { log "cancelled"; return 0; }
+  fi
+  for ref in "${refs[@]}"; do
+    log "recreating $ref"
+    if [ "$BORG_MAJOR" = 1 ]; then "$BORG" recreate --stats --patterns-from "$pf" "$REPO::$ref" || return 1
+    else "$BORG" recreate --stats -a "$ref" --patterns-from "$pf" || return 1; fi
+  done
+  log "archives rewritten (borg replaces the originals). The repo only shrinks after a compact."
+  if [ $COMPACT = 1 ] || { [ "$YES" = 0 ] && [ $INTERACTIVE = 1 ] && confirm "Compact the repo now to free the space?"; }; then x_compact; fi
+}
+
+x_apply_excludes() {   # x_apply_excludes folder|borg|both [refs...]
+  local t=$1 rc=0; shift
+  case "$t" in folder|both) x_apply_excludes_folder || rc=1 ;; esac
+  case "$t" in borg|both) x_apply_excludes_borg "$@" || rc=1 ;; esac
+  return $rc
+}
+
 extras_menu() {
   local x m p enc to dm
   x=$(choose "More: repos, transfer, maintenance" \
       "Switch the Borg repo used in this session" \
       "Create a new Borg repo" \
       "Copy archives to another repo" \
-      "Edit exclusions file" "Prune old archives" "Compact repo (free space)" "Check repo" "Break a stale lock" "Back") || return 0
+      "Edit exclusions file" "Apply exclusions to existing backups" "Prune old archives" "Compact repo (free space)" "Check repo" "Break a stale lock" "Back") || return 0
   case "$x" in
     Switch*) m=$(choose "Borg version of that repo" "Borg 1 (stable)" "Borg 2 (experimental)") || return 0
       case "$m" in "Borg 1"*) m=1 ;; *) m=2 ;; esac
@@ -681,6 +771,9 @@ extras_menu() {
       fi
       x_transfer "$dm" "$to" 0 "${refs[@]}" ;;
     Edit*) x_edit_excludes; return 0 ;;
+    Apply*) enc=$(choose "Apply the exclusions to..." "The folder copy" "Borg archives" "Both") || return 0
+      case "$enc" in "The folder"*) to=folder ;; Borg*) to=borg ;; *) to=both ;; esac
+      x_apply_excludes "$to" ;;
     Prune*) x_prune ;;
     Compact*) x_compact ;;
     Check*) x_check ;;
@@ -726,7 +819,7 @@ if [ $STATUS = 1 ]; then
 fi
 if [ $LISTARCH = 1 ]; then borg_check_repo; list_archives | cut -d'|' -f1,2; exit 0; fi
 
-case "$MODE" in prune|compact|check|unlock|init|transfer) ;; p2f|p2b|p2fb|f2b|f2p|b2f|b2p) ;; *) fail "bad --mode '$MODE' (see --help)" ;; esac
+case "$MODE" in prune|compact|check|unlock|init|transfer|apply-excludes) ;; p2f|p2b|p2fb|f2b|f2p|b2f|b2p) ;; *) fail "bad --mode '$MODE' (see --help)" ;; esac
 if [ $ASK = 1 ] && [ $FULL_SET = 0 ] && [ "$MODE" != b2f ] && [ "$MODE" != b2p ]; then
   inc=$(choose "What should be included?" "Images & videos only (default)" "Everything (full backup - can be much bigger)") || exit 0
   case "$inc" in Everything*) FULL=1 ;; esac
@@ -772,6 +865,8 @@ case "$MODE" in
   check) x_check || overall=2 ;;
   unlock) x_unlock || overall=2 ;;
   init) x_init_repo "$BORG_MAJOR" "$NEW_REPO" "$ENC" || overall=2 ;;
+  apply-excludes) case "$TARGET" in folder|borg|both) ;; *) fail "--target folder|borg|both is required" ;; esac
+    x_apply_excludes "$TARGET" ${ARCHREF:+"$ARCHREF"} || overall=2 ;;
   transfer) x_transfer "${TO_MAJOR:-$BORG_MAJOR}" "$TO_REPO" "$DELETE_SRC" || overall=2 ;;
 esac
 

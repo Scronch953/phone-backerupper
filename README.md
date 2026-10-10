@@ -87,6 +87,13 @@ Example - skip TV episodes, which have an `S01E02`-style marker in the name (any
 
 The same file feeds both, so the folder copy and the Borg archives match by default; use `[folder]` / `[borg]` sections only if you want them to differ. Patterns are shell globs and are case-sensitive (`*.TMP` is not `*.tmp`). Exclusions apply when backing up from the phone or the folder (not to restores), in both the default images-and-videos mode and `--full`. `--show-excludes` prints what will be passed to rsync and Borg. Excluding something does not remove it from existing archives or the folder.
 
+### Applying exclusions to what you already have (extra)
+
+Menu: **More... > Apply exclusions to existing backups**, or `--mode apply-excludes --target folder|borg|both [--archive REF] [--compact] [--yes]`.
+
+* **Folder copy:** files matching the exclusions are moved to your **Trash** (`gio trash`), never `rm`'d, so you can put them back. It uses rsync's own matching, so the result is exactly what a fresh sync would have skipped. Only plain files inside the folder copy are touched, anything it can't map to such a file is left alone, and if there's no usable Trash it removes nothing. Empty folders left behind are tidied. The phone is never touched. Empty the Trash to get the space back.
+* **Borg:** archives are rewritten with `borg recreate` (Borg 1 and 2). Borg **replaces** the original archives itself, so there's nothing to delete afterwards, but this is permanent: the files are gone from those archives for good. The repo only shrinks after a `compact`, which it offers (or `--compact`). It first previews how many items each archive would lose, and asks before doing anything; unattended use needs `--yes`.
+
 ## Extras (optional)
 
 None of this is needed for ordinary phone backups. In the menu: **More...**
