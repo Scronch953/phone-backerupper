@@ -22,7 +22,7 @@
 #   --yes         don't ask for confirmation (timers/scripts)
 #   --borg1       use Borg 1 (default)           --borg2   use Borg 2 (EXPERIMENTAL)
 #   --compact     run `borg compact` after a Borg backup (slow; frees space from pruned archives)
-#   --no-prune    keep every archive
+#   --no-prune    keep every archive      --keep-last N   retention = just the newest N archives (use with --mode prune)
 #   --history M   EXPERIMENTAL: after a Phone->Folder sync, keep a dated copy of the folder
 #                 in "<folder>-history". M = reflink (btrfs/XFS: shares disk space, nearly free)
 #                         or hardlink (any Linux filesystem: unchanged files share space).
@@ -96,6 +96,7 @@ while [ $# -gt 0 ]; do
     --borg2) BORG_MAJOR=2 ;;
     --compact) COMPACT=1 ;;
     --no-prune) PRUNE=0 ;;
+    --keep-last) KEEP=(--keep-last "${2:-1}"); shift ;;
     --history) HISTORY="${2:-}"; shift ;;
     --history=*) HISTORY="${1#*=}" ;;
     --plain) PLAIN=1 ;;
